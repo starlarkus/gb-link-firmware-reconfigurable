@@ -35,6 +35,41 @@
 #include "hardware/pio.h"
 #include "pio/pio_spi.h"
 #include "pico/time.h"
+#include "hardware/clocks.h"
+
+// --- WS2812 PIO DRIVER ADDITION ---
+static const uint16_t ws2812_program_instructions[] = {
+    0x6221, //  0: out    x, 1            side 0 [2] 
+    0x1123, //  1: jmp    !x, 3           side 1 [1] 
+    0x1100, //  2: jmp    0               side 1 [1] 
+    0xa442, //  3: nop                    side 0 [4] 
+};
+
+static const struct pio_program ws2812_program = {
+    .instructions = ws2812_program_instructions,
+    .length = 4,
+    .origin = -1,
+};
+
+void ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq, bool rgbw) {
+    pio_gpio_init(pio, pin);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    pio_sm_config c = pio_get_default_sm_config();
+    sm_config_set_sideset_pins(&c, pin);
+    sm_config_set_out_shift(&c, false, true, rgbw ? 32 : 24);
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    int cycles_per_bit = (1 + 1 + 2) + (1 + 1 + 2) + (1 + 1 + 4);
+    float div = clock_get_hz(clk_sys) / (freq * cycles_per_bit);
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset + (rgbw ? 0 : 4), &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+// Helper: Sets the color. Format: 0x00GGRRBB
+void set_neopixel(uint32_t pixel_grb) {
+    // Uses PIO0, SM0 to avoid conflict with SPI on PIO1
+    pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
+}
 
 #define NUM_CMP_BYTES 0x20
 #define NUM_CMP_BYTES_RECV (NUM_CMP_BYTES+4)
@@ -47,6 +82,7 @@
 #define PIN_SCK 0
 #define PIN_SIN 1
 #define TEST_PIN 6
+#define WS2812_PIN 16
 
 uint PIN_SOUT = 2;
 uint SI_PIN = 3;
@@ -129,7 +165,9 @@ int main(void)
     SI_PIN = 3;
   }
 
-  //board_init();
+  board_init();
+  uint offset = pio_add_program(pio0, &ws2812_program);
+  ws2812_program_init(pio0, 0, offset, WS2812_PIN, 800000, false);
   buf_count = 0;
   uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
   pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
@@ -259,9 +297,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       // Always lit LED if connected
       if ( web_serial_connected )
       {
-        board_led_write(true);
+        //board_led_write(true);
+        set_neopixel(0x000005); // Blue (WebUSB Active)
         blink_interval_ms = BLINK_ALWAYS_ON;
-
+        
         // tud_vendor_write_str("\r\nTinyUSB WebUSB device example\r\n");
       }else
       {
@@ -396,6 +435,18 @@ void led_blinking_task(void)
   if ( board_millis() - start_ms < blink_interval_ms) return; // not enough time
   start_ms += blink_interval_ms;
 
-  board_led_write(led_state);
   led_state = 1 - led_state; // toggle
+
+  // Logic: Turn LED ON if state is true or if we want it always on
+  if (led_state || blink_interval_ms == BLINK_ALWAYS_ON) {
+     if (blink_interval_ms == BLINK_MOUNTED) {
+         set_neopixel(0x050000); // Green (Mounted)
+     } else if (blink_interval_ms == BLINK_NOT_MOUNTED) {
+         set_neopixel(0x000500); // Red (Not Mounted)
+     } else if (blink_interval_ms == BLINK_ALWAYS_ON) {
+         set_neopixel(0x000005); // Blue (WebUSB Active)
+     }
+  } else {
+     set_neopixel(0x000000); // Off
+  }
 }
