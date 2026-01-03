@@ -52,8 +52,14 @@ static const struct pio_program ws2812_program = {
 };
 
 void ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq, bool rgbw) {
+    // Ensure clean state - critical for proper operation after reset
+    pio_sm_set_enabled(pio, sm, false);
+    pio_sm_clear_fifos(pio, sm);
+    pio_sm_restart(pio, sm);
+    
     pio_gpio_init(pio, pin);
     pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
+    
     pio_sm_config c = pio_get_default_sm_config();
     sm_config_set_sideset(&c, 1, false, false);  // 1 sideset bit, not optional, no pindirs
     sm_config_set_sideset_pins(&c, pin);
@@ -63,7 +69,8 @@ void ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq, bo
     int cycles_per_bit = (1 + 1 + 2) + (1 + 1 + 2) + (1 + 1 + 4);
     float div = clock_get_hz(clk_sys) / (freq * cycles_per_bit);
     sm_config_set_clkdiv(&c, div);
-    pio_sm_init(pio, sm, offset, &c);  // Always start at offset 0 of the program
+    
+    pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 }
 
@@ -71,6 +78,8 @@ void ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq, bo
 void set_neopixel(uint32_t pixel_grb) {
     // Uses PIO0, SM0 to avoid conflict with SPI on PIO1
     pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
+    // WS2812 needs ~50us reset time between updates, but the blink interval
+    // is long enough that this is handled naturally
 }
 
 #define NUM_CMP_BYTES 0x20
@@ -452,4 +461,3 @@ void led_blinking_task(void)
      set_neopixel(0x000000); // Off
   }
 }
-
