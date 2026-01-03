@@ -55,13 +55,15 @@ void ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq, bo
     pio_gpio_init(pio, pin);
     pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
     pio_sm_config c = pio_get_default_sm_config();
+    sm_config_set_sideset(&c, 1, false, false);  // 1 sideset bit, not optional, no pindirs
     sm_config_set_sideset_pins(&c, pin);
     sm_config_set_out_shift(&c, false, true, rgbw ? 32 : 24);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
+    sm_config_set_wrap(&c, offset, offset + 3);  // Wrap from instruction 3 back to 0
     int cycles_per_bit = (1 + 1 + 2) + (1 + 1 + 2) + (1 + 1 + 4);
     float div = clock_get_hz(clk_sys) / (freq * cycles_per_bit);
     sm_config_set_clkdiv(&c, div);
-    pio_sm_init(pio, sm, offset + (rgbw ? 0 : 4), &c);
+    pio_sm_init(pio, sm, offset, &c);  // Always start at offset 0 of the program
     pio_sm_set_enabled(pio, sm, true);
 }
 
@@ -450,3 +452,4 @@ void led_blinking_task(void)
      set_neopixel(0x000000); // Off
   }
 }
+
