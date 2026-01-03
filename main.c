@@ -37,30 +37,9 @@
 #include "pico/time.h"
 #include "hardware/clocks.h"
 
-// --- WS2812 PIO DRIVER (from official pico-examples) ---
-// This is the exact WS2812 PIO program from the Raspberry Pi Pico examples
-// Program: .side_set 1
-//   .wrap_target
-//   bitloop:
-//       out x, 1       side 0 [T3 - 1] ; T3 = 3
-//       jmp !x do_zero side 1 [T1 - 1] ; T1 = 2
-//   do_one:
-//       jmp  bitloop   side 1 [T2 - 1] ; T2 = 3
-//   do_zero:
-//       nop            side 0 [T2 - 1]
-//   .wrap
-
-#define WS2812_T1 2
-#define WS2812_T2 3
-#define WS2812_T3 3
-
+// --- WS2812 NeoPixel PIO Driver ---
 static const uint16_t ws2812_program_instructions[] = {
-    //     .wrap_target
-    0x6221, //  0: out    x, 1            side 0 [2]
-    0x1123, //  1: jmp    !x, 3           side 1 [1]
-    0x1400, //  2: jmp    0               side 1 [2]
-    0xa442, //  3: nop                    side 0 [4]
-    //     .wrap
+    0x6221, 0x1123, 0x1400, 0xa442
 };
 
 static const struct pio_program ws2812_program = {
@@ -69,32 +48,24 @@ static const struct pio_program ws2812_program = {
     .origin = -1,
 };
 
-static inline void ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq, bool rgbw) {
+static inline void ws2812_program_init(PIO pio, uint sm, uint offset, uint pin, float freq) {
     pio_gpio_init(pio, pin);
     pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, true);
 
     pio_sm_config c = pio_get_default_sm_config();
     sm_config_set_sideset(&c, 1, false, false);
     sm_config_set_sideset_pins(&c, pin);
-    sm_config_set_out_shift(&c, false, true, rgbw ? 32 : 24);
+    sm_config_set_out_shift(&c, false, true, 24);
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-    sm_config_set_wrap(&c, offset + 0, offset + 3);
-
-    int cycles_per_bit = WS2812_T1 + WS2812_T2 + WS2812_T3;
-    float div = clock_get_hz(clk_sys) / (freq * cycles_per_bit);
-    sm_config_set_clkdiv(&c, div);
+    sm_config_set_wrap(&c, offset, offset + 3);
+    sm_config_set_clkdiv(&c, clock_get_hz(clk_sys) / (freq * 8.0f));
 
     pio_sm_init(pio, sm, offset, &c);
     pio_sm_set_enabled(pio, sm, true);
 }
 
-static inline void put_pixel(uint32_t pixel_grb) {
-    pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
-}
-
-// Helper: Sets the color. Format: 0xGGRRBB (Green, Red, Blue)
 void set_neopixel(uint32_t pixel_grb) {
-    put_pixel(pixel_grb);
+    pio_sm_put_blocking(pio0, 0, pixel_grb << 8u);
 }
 
 #define NUM_CMP_BYTES 0x20
@@ -193,7 +164,7 @@ int main(void)
 
   board_init();
   uint offset = pio_add_program(pio0, &ws2812_program);
-  ws2812_program_init(pio0, 0, offset, WS2812_PIN, 800000, false);
+  ws2812_program_init(pio0, 0, offset, WS2812_PIN, 800000);
   buf_count = 0;
   uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
   pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
@@ -313,23 +284,17 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         return false;
       }
     case 0x22:
-      // Webserial simulate the CDC_REQUEST_SET_CONTROL_LINE_STATE (0x22) to connect and disconnect.
+      // WebSerial connect/disconnect
       web_serial_connected = (request->wValue != 0);
-      
       total_transferred = 0;
       num_bytes_per_transfer = NUM_DEFAULT_BYTES_PER_TRANSFER;
       us_between_transfer = US_DEFAULT_PER_TRANSFER;
 
-      // Always lit LED if connected
-      if ( web_serial_connected )
-      {
-        //board_led_write(true);
-        set_neopixel(0x000005); // Blue (WebUSB Active)
+      if (web_serial_connected) {
+        set_neopixel(0x000005); // Blue (Active)
         blink_interval_ms = BLINK_ALWAYS_ON;
-        
-        // tud_vendor_write_str("\r\nTinyUSB WebUSB device example\r\n");
-      }else
-      {
+      } else {
+        set_neopixel(0x050000); // Green (Mounted) - immediate feedback
         blink_interval_ms = BLINK_MOUNTED;
       }
 
@@ -457,22 +422,22 @@ void led_blinking_task(void)
   static uint32_t start_ms = 0;
   static bool led_state = false;
 
-  // Blink every interval ms
-  if ( board_millis() - start_ms < blink_interval_ms) return; // not enough time
+  if (board_millis() - start_ms < blink_interval_ms) return;
   start_ms += blink_interval_ms;
 
-  led_state = 1 - led_state; // toggle
+  led_state = !led_state;
 
-  // Logic: Turn LED ON if state is true or if we want it always on
-  if (led_state || blink_interval_ms == BLINK_ALWAYS_ON) {
-     if (blink_interval_ms == BLINK_MOUNTED) {
-         set_neopixel(0x050000); // Green (Mounted)
-     } else if (blink_interval_ms == BLINK_NOT_MOUNTED) {
-         set_neopixel(0x000500); // Red (Not Mounted)
-     } else if (blink_interval_ms == BLINK_ALWAYS_ON) {
-         set_neopixel(0x000005); // Blue (WebUSB Active)
-     }
+  if (blink_interval_ms == BLINK_ALWAYS_ON) {
+    // Solid color - handled when state changes, don't toggle
+    return;
+  }
+
+  if (led_state) {
+    if (blink_interval_ms == BLINK_MOUNTED)
+      set_neopixel(0x050000); // Green
+    else if (blink_interval_ms == BLINK_NOT_MOUNTED)
+      set_neopixel(0x000500); // Red
   } else {
-     set_neopixel(0x000000); // Off
+    set_neopixel(0x000000); // Off
   }
 }
