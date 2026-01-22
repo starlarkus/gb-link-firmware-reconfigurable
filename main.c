@@ -486,14 +486,26 @@ void led_blinking_task(void)
 }
 
 //--------------------------------------------------------------------+
-// PRINTER MODE - GPIO bit-bang SPI slave
+// PRINTER MODE - GPIO bit-bang SPI slave with protocol handling
 //--------------------------------------------------------------------+
+
+// Printer protocol states
+enum printer_state {
+  GB_WAIT_FOR_SYNC_1,
+  GB_WAIT_FOR_SYNC_2,
+  GB_COMMAND,
+  GB_COMPRESSION_INDICATOR,
+  GB_LEN_LOWER,
+  GB_LEN_HIGHER,
+  GB_DATA,
+  GB_CHECKSUM_1,
+  GB_CHECKSUM_2,
+  GB_SEND_DEVICE_ID,
+  GB_SEND_STATUS
+};
+
 void printer_mode_loop(void) {
   // Reconfigure pins for GPIO bit-bang mode (SPI slave)
-  // SCK = input (Game Boy provides clock)
-  // SIN = input (data from Game Boy)
-  // SOUT = output (data to Game Boy)
-  
   gpio_init(PIN_SCK);
   gpio_init(PIN_SIN);
   gpio_init(PIN_SOUT);
@@ -503,56 +515,59 @@ void printer_mode_loop(void) {
   gpio_set_dir(PIN_SOUT, GPIO_OUT);
   gpio_put(PIN_SOUT, 0);
   
+  // Bit-level variables
   uint8_t received_data = 0;
   uint8_t received_bits = 0;
-  uint8_t send_data = 0x00;  // Default response byte
-  bool synced = false;
+  uint8_t send_data = 0x00;
+  bool bit_synced = false;
   
-  // Timeout counter for detecting disconnection
+  // Protocol state machine
+  enum printer_state state = GB_WAIT_FOR_SYNC_1;
+  uint8_t command = 0;
+  uint16_t length = 0;
+  uint16_t data_count = 0;
+  uint8_t printer_status = 0x00;  // 0x00 = OK, ready
+  
+  // Timeout for disconnection detection
   uint32_t idle_count = 0;
-  const uint32_t IDLE_TIMEOUT = 10000000;  // ~10 seconds of no activity
+  const uint32_t IDLE_TIMEOUT = 10000000;
+  
+  // Send start marker to browser
+  uint8_t start_marker = 0xFF;
+  echo_all(&start_marker, 1);
+  tud_vendor_flush();
   
   while (printer_mode && web_serial_connected) {
-    // Check for incoming USB data (next byte to send to GB)
-    tud_task();
-    if (tud_vendor_available()) {
-      uint8_t usb_buf[1];
-      if (tud_vendor_read(usb_buf, 1) > 0) {
-        send_data = usb_buf[0];
-      }
-    }
-    
-    // Wait for clock to go low (with timeout check)
+    // Wait for clock to go low (with timeout)
     idle_count = 0;
     while (gpio_get(PIN_SCK)) {
       idle_count++;
       if (idle_count > IDLE_TIMEOUT) {
-        // No clock activity - check USB connection still valid
         tud_task();
         if (!web_serial_connected) {
-          return;  // Exit printer mode
+          goto exit_printer_mode;
         }
         idle_count = 0;
       }
     }
     
-    // Clock is LOW - output our bit
+    // Clock is LOW - output our bit (LSB first)
     gpio_put(PIN_SOUT, send_data & 0x1);
     send_data = send_data >> 1;
     
     // Wait for clock to go high
     while (!gpio_get(PIN_SCK)) {}
     
-    // Clock is HIGH - sample input bit
+    // Clock is HIGH - sample input bit (MSB first)
     received_data = (received_data << 1) | (gpio_get(PIN_SIN) & 0x1);
     
-    // Sync detection - look for 0x88 pattern
-    if (!synced) {
+    // Bit sync detection - look for 0x88 pattern
+    if (!bit_synced) {
       if (received_data != 0x88) {
         continue;
       } else {
         received_bits = 8;
-        synced = true;
+        bit_synced = true;
       }
     } else {
       received_bits++;
@@ -563,17 +578,117 @@ void printer_mode_loop(void) {
       continue;
     }
     
-    // Send received byte to browser
-    uint8_t out_byte = received_data;
-    echo_all(&out_byte, 1);
-    tud_vendor_flush();
-    
-    // Reset for next byte
+    // We have a complete byte - process it
+    uint8_t byte = received_data;
     received_data = 0;
     received_bits = 0;
-    send_data = 0x00;  // Default for next byte, will be overwritten if USB data available
+    
+    // Protocol state machine - handle byte and set response for NEXT byte
+    switch (state) {
+      case GB_WAIT_FOR_SYNC_1:
+        if (byte == 0x88) {
+          state = GB_WAIT_FOR_SYNC_2;
+        }
+        send_data = 0x00;
+        break;
+        
+      case GB_WAIT_FOR_SYNC_2:
+        if (byte == 0x33) {
+          state = GB_COMMAND;
+        } else {
+          state = GB_WAIT_FOR_SYNC_1;
+          bit_synced = false;
+        }
+        send_data = 0x00;
+        break;
+        
+      case GB_COMMAND:
+        command = byte;
+        state = GB_COMPRESSION_INDICATOR;
+        send_data = 0x00;
+        
+        // Send command to browser for logging
+        echo_all(&byte, 1);
+        break;
+        
+      case GB_COMPRESSION_INDICATOR:
+        state = GB_LEN_LOWER;
+        send_data = 0x00;
+        // Send compression byte to browser
+        echo_all(&byte, 1);
+        break;
+        
+      case GB_LEN_LOWER:
+        length = byte;
+        state = GB_LEN_HIGHER;
+        send_data = 0x00;
+        break;
+        
+      case GB_LEN_HIGHER:
+        length |= ((uint16_t)byte << 8);
+        data_count = 0;
+        
+        if (length > 0) {
+          state = GB_DATA;
+        } else {
+          state = GB_CHECKSUM_1;
+        }
+        send_data = 0x00;
+        
+        // Send length to browser (2 bytes, little endian)
+        uint8_t len_bytes[2] = { length & 0xFF, (length >> 8) & 0xFF };
+        echo_all(len_bytes, 2);
+        break;
+        
+      case GB_DATA:
+        data_count++;
+        
+        // Send data byte to browser
+        echo_all(&byte, 1);
+        
+        if (data_count >= length) {
+          state = GB_CHECKSUM_1;
+        }
+        send_data = 0x00;
+        break;
+        
+      case GB_CHECKSUM_1:
+        state = GB_CHECKSUM_2;
+        send_data = 0x00;
+        break;
+        
+      case GB_CHECKSUM_2:
+        state = GB_SEND_DEVICE_ID;
+        // Set device ID response for next exchange
+        send_data = 0x81;  // Printer device ID
+        break;
+        
+      case GB_SEND_DEVICE_ID:
+        state = GB_SEND_STATUS;
+        // Set status response for next exchange
+        send_data = printer_status;  // 0x00 = OK
+        break;
+        
+      case GB_SEND_STATUS:
+        state = GB_WAIT_FOR_SYNC_1;
+        bit_synced = false;
+        send_data = 0x00;
+        
+        // Reset for print command
+        if (command == 0x02) {  // PRINT command
+          // Send print marker to browser
+          uint8_t print_marker = 0xFE;
+          echo_all(&print_marker, 1);
+        }
+        break;
+    }
+    
+    // Flush USB periodically
+    tud_task();
+    tud_vendor_flush();
   }
-  
+
+exit_printer_mode:
   // Re-initialize GPIO for PIO SPI mode
   pio_gpio_init(spi.pio, PIN_SOUT);
   pio_gpio_init(spi.pio, PIN_SIN);
