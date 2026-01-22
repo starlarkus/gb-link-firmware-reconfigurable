@@ -76,6 +76,17 @@ void set_neopixel(uint32_t pixel_grb) {
 
 #define MAX_TRANSFER_BYTES 0x40
 
+// Printer mode constants
+#define PRINTER_MODE_MAGIC_LEN 36
+static uint8_t printer_mode_magic[PRINTER_MODE_MAGIC_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'P', 'R', 'N', 'T'  // "PRNT" to indicate printer mode
+};
+static bool printer_mode = false;
+
 #define PIN_SCK 0
 #define PIN_SIN 1
 #define TEST_PIN 6
@@ -139,6 +150,7 @@ void data_transfer_task(void);
 void led_blinking_task(void);
 void cdc_task(void);
 void webserial_task(void);
+void printer_mode_loop(void);
 
 /*------------- MAIN -------------*/
 
@@ -336,7 +348,38 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
   for(int i = count; i < (MAX_TRANSFER_BYTES*2); i++)
     buf_in[i] = 0;
   uint8_t processed = 0;
-  if(count == NUM_CMP_BYTES_RECV) {
+  // Check for printer mode magic sequence
+  if(count == PRINTER_MODE_MAGIC_LEN) {
+    uint8_t is_printer_mode = 1;
+    for(int i = 0; i < PRINTER_MODE_MAGIC_LEN; i++) {
+      if(buf_in[i] != printer_mode_magic[i]) {
+        is_printer_mode = 0;
+        break;
+      }
+    }
+    if(is_printer_mode) {
+      // Acknowledge and enter printer mode
+      uint8_t ack = 0x50; // 'P' for printer
+      echo_all(&ack, 1);
+      printer_mode = true;
+      set_neopixel(0x050005); // Purple for printer mode
+      
+      // Disable PIO SPI and reconfigure pins for GPIO
+      pio_sm_set_enabled(spi.pio, spi.sm, false);
+      
+      // Run printer loop (this blocks until disconnected)
+      printer_mode_loop();
+      
+      // Re-enable PIO SPI when exiting printer mode
+      pio_sm_set_enabled(spi.pio, spi.sm, true);
+      printer_mode = false;
+      set_neopixel(0x000005); // Blue (Active)
+      processed = 1;
+    }
+  }
+  
+  // Check for timing config magic sequence
+  if(!processed && count == NUM_CMP_BYTES_RECV) {
     uint8_t failed = 0;
     for(int i = 0; i < NUM_CMP_BYTES; i++)
       if(buf_in[i] != compare_bytes[i]) {
@@ -441,3 +484,99 @@ void led_blinking_task(void)
     set_neopixel(0x000000); // Off
   }
 }
+
+//--------------------------------------------------------------------+
+// PRINTER MODE - GPIO bit-bang SPI slave
+//--------------------------------------------------------------------+
+void printer_mode_loop(void) {
+  // Reconfigure pins for GPIO bit-bang mode (SPI slave)
+  // SCK = input (Game Boy provides clock)
+  // SIN = input (data from Game Boy)
+  // SOUT = output (data to Game Boy)
+  
+  gpio_init(PIN_SCK);
+  gpio_init(PIN_SIN);
+  gpio_init(PIN_SOUT);
+  
+  gpio_set_dir(PIN_SCK, GPIO_IN);
+  gpio_set_dir(PIN_SIN, GPIO_IN);
+  gpio_set_dir(PIN_SOUT, GPIO_OUT);
+  gpio_put(PIN_SOUT, 0);
+  
+  uint8_t received_data = 0;
+  uint8_t received_bits = 0;
+  uint8_t send_data = 0x00;  // Default response byte
+  bool synced = false;
+  
+  // Timeout counter for detecting disconnection
+  uint32_t idle_count = 0;
+  const uint32_t IDLE_TIMEOUT = 10000000;  // ~10 seconds of no activity
+  
+  while (printer_mode && web_serial_connected) {
+    // Check for incoming USB data (next byte to send to GB)
+    tud_task();
+    if (tud_vendor_available()) {
+      uint8_t usb_buf[1];
+      if (tud_vendor_read(usb_buf, 1) > 0) {
+        send_data = usb_buf[0];
+      }
+    }
+    
+    // Wait for clock to go low (with timeout check)
+    idle_count = 0;
+    while (gpio_get(PIN_SCK)) {
+      idle_count++;
+      if (idle_count > IDLE_TIMEOUT) {
+        // No clock activity - check USB connection still valid
+        tud_task();
+        if (!web_serial_connected) {
+          return;  // Exit printer mode
+        }
+        idle_count = 0;
+      }
+    }
+    
+    // Clock is LOW - output our bit
+    gpio_put(PIN_SOUT, send_data & 0x1);
+    send_data = send_data >> 1;
+    
+    // Wait for clock to go high
+    while (!gpio_get(PIN_SCK)) {}
+    
+    // Clock is HIGH - sample input bit
+    received_data = (received_data << 1) | (gpio_get(PIN_SIN) & 0x1);
+    
+    // Sync detection - look for 0x88 pattern
+    if (!synced) {
+      if (received_data != 0x88) {
+        continue;
+      } else {
+        received_bits = 8;
+        synced = true;
+      }
+    } else {
+      received_bits++;
+    }
+    
+    // Check if we have a complete byte
+    if (received_bits != 8) {
+      continue;
+    }
+    
+    // Send received byte to browser
+    uint8_t out_byte = received_data;
+    echo_all(&out_byte, 1);
+    tud_vendor_flush();
+    
+    // Reset for next byte
+    received_data = 0;
+    received_bits = 0;
+    send_data = 0x00;  // Default for next byte, will be overwritten if USB data available
+  }
+  
+  // Re-initialize GPIO for PIO SPI mode
+  pio_gpio_init(spi.pio, PIN_SOUT);
+  pio_gpio_init(spi.pio, PIN_SIN);
+  pio_gpio_init(spi.pio, PIN_SCK);
+}
+
