@@ -531,6 +531,7 @@ void printer_mode_loop(void) {
   // Timeout for disconnection detection
   uint32_t idle_count = 0;
   const uint32_t IDLE_TIMEOUT = 10000000;
+  const uint32_t PRINT_ABORT_TIMEOUT = 2000000;  // ~200ms for mid-print cancellation detection
   
   // Send start marker to browser
   uint8_t start_marker = 0xFF;
@@ -539,14 +540,38 @@ void printer_mode_loop(void) {
   
   while (printer_mode && web_serial_connected) {
     // Wait for clock to go low (with timeout)
+    // Use shorter timeout when mid-packet (print abort detection)
     idle_count = 0;
+    uint32_t timeout = (state != GB_WAIT_FOR_SYNC_1 && state != GB_WAIT_FOR_SYNC_2) 
+                       ? PRINT_ABORT_TIMEOUT : IDLE_TIMEOUT;
+    
     while (gpio_get(PIN_SCK)) {
       idle_count++;
-      if (idle_count > IDLE_TIMEOUT) {
+      if (idle_count > timeout) {
         tud_task();
         if (!web_serial_connected) {
           goto exit_printer_mode;
         }
+        
+        // If we timed out mid-packet, the print was aborted
+        if (state != GB_WAIT_FOR_SYNC_1 && state != GB_WAIT_FOR_SYNC_2) {
+          // Reset state machine
+          state = GB_WAIT_FOR_SYNC_1;
+          bit_synced = false;
+          received_data = 0;
+          received_bits = 0;
+          send_data = 0x00;
+          
+          // Send "ABORTPRINT" to browser to signal print abort
+          // ASCII string is impossible to occur in Game Boy tile data
+          const char* abort_marker = "ABORTPRINT";
+          echo_all((uint8_t*)abort_marker, 10);
+          tud_vendor_flush();
+          
+          // Break out of clock wait loop to start fresh
+          break;
+        }
+        
         idle_count = 0;
       }
     }
