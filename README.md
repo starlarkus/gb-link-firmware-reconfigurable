@@ -38,3 +38,5 @@ The onboard RGB LED (GP16) indicates the current connection status:
     make
     ```
 3.  **Flash:** Hold the `BOOT` button on the RP2040, plug it in, and drag the generated `.uf2` file into the `RPI-RP2` drive.
+
+Print functionality derived from firmware at https://github.com/stacksmashing/gb-link-printer
