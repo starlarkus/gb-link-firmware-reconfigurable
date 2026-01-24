@@ -38,3 +38,9 @@ The onboard RGB LED (GP16) indicates the current connection status:
     make
     ```
 3.  **Flash:** Hold the `BOOT` button on the RP2040, plug it in, and drag the generated `.uf2` file into the `RPI-RP2` drive.
+
+## Troubleshooting
+- Currently when refreshing the web page on WebUSB devices the pico/usb device needs to be reset. Unplugging or pressing reset on the USB adapter should acomplish this
+- If on linux you may need to edit Udev rules. See here https://stackoverflow.com/questions/30983221/chrome-app-fails-to-open-usb-device
+
+Print functionality derived from firmware at https://github.com/stacksmashing/gb-link-printer
