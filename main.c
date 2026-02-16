@@ -202,11 +202,9 @@ const tusb_desc_webusb_url_t desc_url =
 };
 
 static bool web_serial_connected = false;
-static bool send_firmware_version = false;
 
-// Firmware version string sent on WebSerial connect
-#define FIRMWARE_VERSION_STR "GBLINK:1.0.6\n"
-#define FIRMWARE_VERSION_LEN (sizeof(FIRMWARE_VERSION_STR) - 1)
+// Firmware version returned via control transfer (request 0x23)
+static const char FIRMWARE_VERSION_STR[] = "GBLINK:1.0.6";
 
 //------------- prototypes -------------//
 void handle_input_data(uint8_t* buf_in, uint32_t count);
@@ -371,7 +369,6 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       if (web_serial_connected) {
         set_neopixel(0x000005); // Blue (Active)
         blink_interval_ms = BLINK_ALWAYS_ON;
-        send_firmware_version = true;
       } else {
         set_neopixel(0x050000); // Green (Mounted) - immediate feedback
         blink_interval_ms = BLINK_MOUNTED;
@@ -380,6 +377,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       // response with status OK
       return tud_control_status(rhport, request);
       break;
+
+    case 0x23:
+      // Firmware version query
+      return tud_control_xfer(rhport, request, (void*)FIRMWARE_VERSION_STR, sizeof(FIRMWARE_VERSION_STR) - 1);
 
     default: break;
   }
@@ -531,20 +532,12 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
 
 void webserial_task(void)
 {
-  if ( web_serial_connected ) {
-    // Send firmware version string once after WebSerial connect
-    if (send_firmware_version) {
-      send_firmware_version = false;
-      tud_vendor_write((uint8_t*)FIRMWARE_VERSION_STR, FIRMWARE_VERSION_LEN);
-      tud_vendor_flush();
-    }
-
+  if ( web_serial_connected )
     if ( tud_vendor_available() ) {
       uint8_t buf_in[MAX_TRANSFER_BYTES*2];
       uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
       handle_input_data(buf_in, count);
     }
-  }
 }
 
 
