@@ -104,6 +104,17 @@ static uint8_t vswitch_5v_magic[VSWITCH_MAGIC_LEN] = {
     'V', '5', 'V', '0'  // "V5V0" to indicate 5V mode
 };
 
+// LED color magic packet: 36-byte header + R, G, B, on/off = 40 bytes total
+#define LED_MAGIC_LEN 40
+#define LED_MAGIC_HEADER_LEN 36
+static uint8_t led_magic_header[LED_MAGIC_HEADER_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'L', 'E', 'D', 'S'  // "LEDS" to indicate LED color command
+};
+
 #define PIN_SCK 0
 #define PIN_SIN 1
 #define TEST_PIN 6
@@ -450,6 +461,34 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
     } else if(is_5v) {
       vswitch_set_5v();
       uint8_t ack = 0x35; // '5' for 5V
+      echo_all(&ack, 1);
+      processed = 1;
+    }
+  }
+
+  // Check for LED color magic sequence
+  if(!processed && count == LED_MAGIC_LEN) {
+    uint8_t is_led = 1;
+    for(int i = 0; i < LED_MAGIC_HEADER_LEN; i++) {
+      if(buf_in[i] != led_magic_header[i]) {
+        is_led = 0;
+        break;
+      }
+    }
+    if(is_led) {
+      uint8_t r = buf_in[LED_MAGIC_HEADER_LEN];
+      uint8_t g = buf_in[LED_MAGIC_HEADER_LEN + 1];
+      uint8_t b = buf_in[LED_MAGIC_HEADER_LEN + 2];
+      uint8_t on = buf_in[LED_MAGIC_HEADER_LEN + 3];
+      if(on) {
+        // NeoPixel expects GRB format
+        set_neopixel(((uint32_t)g << 16) | ((uint32_t)r << 8) | b);
+      } else {
+        set_neopixel(0x000000);
+      }
+      // Disable blink task from overriding the color
+      blink_interval_ms = BLINK_ALWAYS_ON;
+      uint8_t ack = 0x4C; // 'L' for LED
       echo_all(&ack, 1);
       processed = 1;
     }
