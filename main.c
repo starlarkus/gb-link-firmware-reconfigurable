@@ -203,9 +203,6 @@ const tusb_desc_webusb_url_t desc_url =
 
 static bool web_serial_connected = false;
 
-// Firmware version returned via control transfer (request 0x23)
-static const char FIRMWARE_VERSION_STR[] = "GBLINK:1.0.6";
-
 //------------- prototypes -------------//
 void handle_input_data(uint8_t* buf_in, uint32_t count);
 void data_transfer_task(void);
@@ -377,10 +374,6 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       // response with status OK
       return tud_control_status(rhport, request);
       break;
-
-    case 0x23:
-      // Firmware version query
-      return tud_control_xfer(rhport, request, (void*)FIRMWARE_VERSION_STR, sizeof(FIRMWARE_VERSION_STR) - 1);
 
     default: break;
   }
