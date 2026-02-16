@@ -87,10 +87,31 @@ static uint8_t printer_mode_magic[PRINTER_MODE_MAGIC_LEN] = {
 };
 static bool printer_mode = false;
 
+// Voltage switch magic packets (36 bytes each, same length as printer mode)
+#define VSWITCH_MAGIC_LEN 36
+static uint8_t vswitch_3v3_magic[VSWITCH_MAGIC_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'V', '3', 'V', '3'  // "V3V3" to indicate 3.3V mode
+};
+static uint8_t vswitch_5v_magic[VSWITCH_MAGIC_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'V', '5', 'V', '0'  // "V5V0" to indicate 5V mode
+};
+
 #define PIN_SCK 0
 #define PIN_SIN 1
 #define TEST_PIN 6
 #define WS2812_PIN 16
+
+// Voltage switch GPIO pins
+#define VSWITCH_3V3_PIN 11
+#define VSWITCH_5V_PIN  12
 
 uint PIN_SOUT = 2;
 uint SI_PIN = 3;
@@ -104,6 +125,33 @@ bool is_test_pin_grounded() {
   bool grounded = gpio_get(TEST_PIN) == 0;
 
   return grounded;
+}
+
+// Voltage switch control: set both HIGH first (safe off), then pull one LOW
+void vswitch_set_3v3(void) {
+  gpio_put(VSWITCH_3V3_PIN, 1);
+  gpio_put(VSWITCH_5V_PIN, 1);
+  busy_wait_us(100);
+  gpio_put(VSWITCH_3V3_PIN, 0);
+}
+
+void vswitch_set_5v(void) {
+  gpio_put(VSWITCH_3V3_PIN, 1);
+  gpio_put(VSWITCH_5V_PIN, 1);
+  busy_wait_us(100);
+  gpio_put(VSWITCH_5V_PIN, 0);
+}
+
+void vswitch_init(void) {
+  gpio_init(VSWITCH_3V3_PIN);
+  gpio_init(VSWITCH_5V_PIN);
+  gpio_set_dir(VSWITCH_3V3_PIN, GPIO_OUT);
+  gpio_set_dir(VSWITCH_5V_PIN, GPIO_OUT);
+  // Start both HIGH (safe), then enable 3.3V as default
+  gpio_put(VSWITCH_3V3_PIN, 1);
+  gpio_put(VSWITCH_5V_PIN, 1);
+  busy_wait_us(100);
+  gpio_put(VSWITCH_3V3_PIN, 0); // 3.3V mode (default)
 }
 
 //--------------------------------------------------------------------+
@@ -143,6 +191,11 @@ const tusb_desc_webusb_url_t desc_url =
 };
 
 static bool web_serial_connected = false;
+static bool send_firmware_version = false;
+
+// Firmware version string sent on WebSerial connect
+#define FIRMWARE_VERSION_STR "GBLINK:1.0.6\n"
+#define FIRMWARE_VERSION_LEN (sizeof(FIRMWARE_VERSION_STR) - 1)
 
 //------------- prototypes -------------//
 void handle_input_data(uint8_t* buf_in, uint32_t count);
@@ -173,6 +226,8 @@ int main(void)
     PIN_SOUT = 2;
     SI_PIN = 3;
   }
+
+  vswitch_init();
 
   board_init();
   uint offset = pio_add_program(pio0, &ws2812_program);
@@ -305,6 +360,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       if (web_serial_connected) {
         set_neopixel(0x000005); // Blue (Active)
         blink_interval_ms = BLINK_ALWAYS_ON;
+        send_firmware_version = true;
       } else {
         set_neopixel(0x050000); // Green (Mounted) - immediate feedback
         blink_interval_ms = BLINK_MOUNTED;
@@ -378,6 +434,27 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
     }
   }
   
+  // Check for voltage switch magic sequences
+  if(!processed && count == VSWITCH_MAGIC_LEN) {
+    uint8_t is_3v3 = 1, is_5v = 1;
+    for(int i = 0; i < VSWITCH_MAGIC_LEN; i++) {
+      if(buf_in[i] != vswitch_3v3_magic[i]) is_3v3 = 0;
+      if(buf_in[i] != vswitch_5v_magic[i]) is_5v = 0;
+      if(!is_3v3 && !is_5v) break;
+    }
+    if(is_3v3) {
+      vswitch_set_3v3();
+      uint8_t ack = 0x33; // '3' for 3.3V
+      echo_all(&ack, 1);
+      processed = 1;
+    } else if(is_5v) {
+      vswitch_set_5v();
+      uint8_t ack = 0x35; // '5' for 5V
+      echo_all(&ack, 1);
+      processed = 1;
+    }
+  }
+
   // Check for timing config magic sequence
   if(!processed && count == NUM_CMP_BYTES_RECV) {
     uint8_t failed = 0;
@@ -415,12 +492,20 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
 
 void webserial_task(void)
 {
-  if ( web_serial_connected )
+  if ( web_serial_connected ) {
+    // Send firmware version string once after WebSerial connect
+    if (send_firmware_version) {
+      send_firmware_version = false;
+      tud_vendor_write((uint8_t*)FIRMWARE_VERSION_STR, FIRMWARE_VERSION_LEN);
+      tud_vendor_flush();
+    }
+
     if ( tud_vendor_available() ) {
       uint8_t buf_in[MAX_TRANSFER_BYTES*2];
       uint32_t count = tud_vendor_read(buf_in, sizeof(buf_in));
       handle_input_data(buf_in, count);
     }
+  }
 }
 
 
