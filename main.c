@@ -125,7 +125,7 @@ static uint8_t led_magic_header[LED_MAGIC_HEADER_LEN] = {
 #define VSWITCH_5V_PIN  12
 
 uint PIN_SOUT = 2;
-uint SI_PIN = 3;
+uint SD_PIN = 3;
 
 bool is_test_pin_grounded() {
   gpio_init(TEST_PIN);
@@ -223,14 +223,14 @@ int main(void)
 {
   // Check the state of TEST_PIN
   if (is_test_pin_grounded()) {
-    // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SI_PIN
+    // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SD_PIN
     PIN_SOUT = 3;
-    SI_PIN = 4;
+    SD_PIN = 4;
   }
   else {
     // GPIO 6 (TEST_PIN) is not grounded, use default values
     PIN_SOUT = 2;
-    SI_PIN = 3;
+    SD_PIN = 3;
   }
 
   vswitch_init();
