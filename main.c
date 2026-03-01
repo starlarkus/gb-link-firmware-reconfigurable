@@ -125,7 +125,7 @@ static uint8_t led_magic_header[LED_MAGIC_HEADER_LEN] = {
 #define VSWITCH_5V_PIN  12
 
 uint PIN_SOUT = 2;
-uint SI_PIN = 3;
+uint SD_PIN = 3;
 
 bool is_test_pin_grounded() {
   gpio_init(TEST_PIN);
@@ -223,14 +223,14 @@ int main(void)
 {
   // Check the state of TEST_PIN
   if (is_test_pin_grounded()) {
-    // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SI_PIN
+    // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SD_PIN
     PIN_SOUT = 3;
-    SI_PIN = 4;
+    SD_PIN = 4;
   }
   else {
     // GPIO 6 (TEST_PIN) is not grounded, use default values
     PIN_SOUT = 2;
-    SI_PIN = 3;
+    SD_PIN = 3;
   }
 
   vswitch_init();
@@ -241,6 +241,15 @@ int main(void)
   buf_count = 0;
   uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
   pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
+
+  // Drive SD (cable pin 4) LOW so the GBA detects the adapter as an external
+  // clock master (GBA reads this via SIOCNT bit 3). Generic GBC cables wire
+  // pin 4 through to the GBA; OEM GBC cables leave it unconnected, so this
+  // is harmless there. SD_PIN tracks the correct GPIO for both hardware
+  // variants (3 in default layout, 4 in the shifted/test-pin layout).
+  gpio_init(SD_PIN);
+  gpio_set_dir(SD_PIN, GPIO_OUT);
+  gpio_put(SD_PIN, 0);
 
   tusb_init();
 

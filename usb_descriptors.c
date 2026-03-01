@@ -54,7 +54,7 @@ tusb_desc_device_t const desc_device =
 
     .idVendor           = 0xCafe,
     .idProduct          = USB_PID,
-    .bcdDevice          = 0x0106,
+    .bcdDevice          = 0x0107,
 
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
