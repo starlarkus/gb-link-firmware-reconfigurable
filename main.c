@@ -36,6 +36,9 @@
 #include "pio/pio_spi.h"
 #include "pico/time.h"
 #include "hardware/clocks.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "hardware/watchdog.h"
 
 // --- WS2812 NeoPixel PIO Driver ---
 static const uint16_t ws2812_program_instructions[] = {
@@ -115,6 +118,135 @@ static uint8_t led_magic_header[LED_MAGIC_HEADER_LEN] = {
     'L', 'E', 'D', 'S'  // "LEDS" to indicate LED color command
 };
 
+// WebUSB landing-page toggle: 36-byte header + 1 value byte = 37 bytes total.
+// value 0x00 = disable, 0x01 = enable, 0xFF = query only. Always responds with
+// the current state (0/1). Persisted in flash; applies on the next reconnect.
+#define LANDING_MAGIC_LEN 37
+#define LANDING_MAGIC_HEADER_LEN 36
+static uint8_t landing_magic_header[LANDING_MAGIC_HEADER_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'L', 'A', 'N', 'D'  // "LAND" to indicate landing-page toggle/query
+};
+
+// Per-mode LED colour commands. Both use length 40 (like the live "LEDS"
+// command) and are distinguished by the 4-char tag at offset 32 — length 40
+// avoids the 36-byte timing command, which only matches the 32-byte prefix.
+//   LEDM (set):  32-byte prefix + "LEDM" + [slot, r, g, b]
+//   LEDG (query): 32-byte prefix + "LEDG" + 4 ignored bytes  -> replies [count, rgb...]
+#define LED_CMD_MAGIC_LEN 40
+#define LED_CMD_HEADER_LEN 36
+static uint8_t led_mode_magic_header[LED_CMD_HEADER_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'L', 'E', 'D', 'M'
+};
+static uint8_t led_get_magic_header[LED_CMD_HEADER_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'L', 'E', 'D', 'G'
+};
+static uint8_t led_reset_magic_header[LED_CMD_HEADER_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'L', 'E', 'D', 'R'
+};
+// Warm-reboot the board into the app (not the bootloader) so persisted settings
+// apply now: 32-byte prefix + "BOOT". Same length (40) as the LED family.
+static uint8_t reboot_magic_header[LED_CMD_HEADER_LEN] = {
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE, 0xCA, 0xFE,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF,
+    'B', 'O', 'O', 'T'
+};
+
+// Persistent settings (last 4 KB flash sector, well past the ~55 KB app): the
+// WebUSB landing-page flag and per-mode LED colours. One versioned struct;
+// erased/old flash falls back to defaults via the magic/version check.
+#define SETTINGS_FLASH_OFFSET (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define SETTINGS_MAGIC 0x5A
+#define SETTINGS_VERSION 4  // bumped to re-default the LED colours
+#define RECFG_LED_SLOTS 3  // 0 = connected, 1 = active/link, 2 = printer
+
+typedef struct {
+    uint8_t magic;
+    uint8_t version;
+    uint8_t landing;                  // 0 = disabled, else enabled
+    uint8_t led[RECFG_LED_SLOTS][3];  // logical RGB
+} persist_settings_t;
+
+// Real-colour defaults at a uniform 50% brightness (128/255).
+static const uint8_t recfg_default_colors[RECFG_LED_SLOTS][3] = {
+    { 0,   128, 0   }, // connected — green
+    { 0,   0,   128 }, // active / link — blue
+    { 128, 0,   128 }, // printer — purple
+};
+
+static void load_settings(persist_settings_t *s) {
+    memcpy(s, (const void *)(XIP_BASE + SETTINGS_FLASH_OFFSET), sizeof(*s));
+    if (s->magic != SETTINGS_MAGIC || s->version != SETTINGS_VERSION) {
+        s->magic = SETTINGS_MAGIC;
+        s->version = SETTINGS_VERSION;
+        s->landing = 1;
+        memcpy(s->led, recfg_default_colors, sizeof(s->led));
+    }
+}
+
+static void save_settings(const persist_settings_t *s) {
+    uint8_t page[FLASH_PAGE_SIZE];
+    memset(page, 0xFF, sizeof(page));
+    memcpy(page, s, sizeof(*s));
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(SETTINGS_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(SETTINGS_FLASH_OFFSET, page, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+}
+
+bool landing_page_enabled(void) {
+    persist_settings_t s; load_settings(&s);
+    return s.landing != 0;
+}
+
+void set_landing_page_enabled(bool enabled) {
+    persist_settings_t s; load_settings(&s);
+    s.landing = enabled ? 1 : 0;
+    save_settings(&s);
+}
+
+static void get_led_color(uint8_t slot, uint8_t out[3]) {
+    if (slot >= RECFG_LED_SLOTS) { out[0] = out[1] = out[2] = 0; return; }
+    persist_settings_t s; load_settings(&s);
+    out[0] = s.led[slot][0]; out[1] = s.led[slot][1]; out[2] = s.led[slot][2];
+}
+
+static void set_led_color(uint8_t slot, uint8_t r, uint8_t g, uint8_t b) {
+    if (slot >= RECFG_LED_SLOTS) return;
+    persist_settings_t s; load_settings(&s);
+    s.led[slot][0] = r; s.led[slot][1] = g; s.led[slot][2] = b;
+    save_settings(&s);
+}
+
+static void reset_led_colors(void) {
+    persist_settings_t s; load_settings(&s);
+    memcpy(s.led, recfg_default_colors, sizeof(s.led));
+    save_settings(&s);
+}
+
+// Apply a slot's stored colour now. set_neopixel wants GRB.
+static void apply_led_for_slot(uint8_t slot) {
+    uint8_t c[3]; get_led_color(slot, c);
+    set_neopixel(((uint32_t)c[1] << 16) | ((uint32_t)c[0] << 8) | c[2]);
+}
+
 #define PIN_SCK 0
 #define PIN_SIN 1
 #define TEST_PIN 6
@@ -191,7 +323,7 @@ static uint8_t num_bytes_per_transfer = NUM_DEFAULT_BYTES_PER_TRANSFER;
 static uint32_t us_between_transfer = US_DEFAULT_PER_TRANSFER;
 static uint32_t total_transferred = 0;
 
-#define URL  "tetris.gblink.io"
+#define URL  "launcher.gblink.io"
 
 const tusb_desc_webusb_url_t desc_url =
 {
@@ -364,10 +496,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
       us_between_transfer = US_DEFAULT_PER_TRANSFER;
 
       if (web_serial_connected) {
-        set_neopixel(0x000005); // Blue (Active)
+        apply_led_for_slot(1); // active / link
         blink_interval_ms = BLINK_ALWAYS_ON;
       } else {
-        set_neopixel(0x050000); // Green (Mounted) - immediate feedback
+        apply_led_for_slot(0); // connected
         blink_interval_ms = BLINK_MOUNTED;
       }
 
@@ -423,7 +555,7 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
       uint8_t ack = 0x50; // 'P' for printer
       echo_all(&ack, 1);
       printer_mode = true;
-      set_neopixel(0x050005); // Purple for printer mode
+      apply_led_for_slot(2); // printer
       
       // Disable PIO SPI and reconfigure pins for GPIO
       pio_sm_set_enabled(spi.pio, spi.sm, false);
@@ -434,7 +566,7 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
       // Re-enable PIO SPI when exiting printer mode
       pio_sm_set_enabled(spi.pio, spi.sm, true);
       printer_mode = false;
-      set_neopixel(0x000005); // Blue (Active)
+      apply_led_for_slot(1); // active / link
       processed = 1;
     }
   }
@@ -483,6 +615,89 @@ void handle_input_data(uint8_t* buf_in, uint32_t count) {
       // Disable blink task from overriding the color
       blink_interval_ms = BLINK_ALWAYS_ON;
       uint8_t ack = 0x4C; // 'L' for LED
+      echo_all(&ack, 1);
+      processed = 1;
+    }
+  }
+
+  // Set a per-mode LED colour (persisted): prefix + "LEDM" + [slot, r, g, b]
+  if(!processed && count == LED_CMD_MAGIC_LEN) {
+    uint8_t is_ledm = 1;
+    for(int i = 0; i < LED_CMD_HEADER_LEN; i++) {
+      if(buf_in[i] != led_mode_magic_header[i]) { is_ledm = 0; break; }
+    }
+    if(is_ledm) {
+      set_led_color(buf_in[LED_CMD_HEADER_LEN], buf_in[LED_CMD_HEADER_LEN + 1],
+                    buf_in[LED_CMD_HEADER_LEN + 2], buf_in[LED_CMD_HEADER_LEN + 3]);
+      uint8_t ack = 0x4D; // 'M'
+      echo_all(&ack, 1);
+      processed = 1;
+    }
+  }
+
+  // Query per-mode LED colours: prefix + "LEDG" -> [count, r0,g0,b0, ...]
+  if(!processed && count == LED_CMD_MAGIC_LEN) {
+    uint8_t is_ledg = 1;
+    for(int i = 0; i < LED_CMD_HEADER_LEN; i++) {
+      if(buf_in[i] != led_get_magic_header[i]) { is_ledg = 0; break; }
+    }
+    if(is_ledg) {
+      uint8_t resp[1 + RECFG_LED_SLOTS * 3];
+      resp[0] = RECFG_LED_SLOTS;
+      for(uint8_t slot = 0; slot < RECFG_LED_SLOTS; slot++) {
+        get_led_color(slot, &resp[1 + slot * 3]);
+      }
+      echo_all(resp, sizeof(resp));
+      processed = 1;
+    }
+  }
+
+  // Reset per-mode LED colours to defaults: prefix + "LEDR"
+  if(!processed && count == LED_CMD_MAGIC_LEN) {
+    uint8_t is_ledr = 1;
+    for(int i = 0; i < LED_CMD_HEADER_LEN; i++) {
+      if(buf_in[i] != led_reset_magic_header[i]) { is_ledr = 0; break; }
+    }
+    if(is_ledr) {
+      reset_led_colors();
+      uint8_t ack = 0x52; // 'R'
+      echo_all(&ack, 1);
+      processed = 1;
+    }
+  }
+
+  // Warm-reboot into the app so saved settings apply now: prefix + "BOOT"
+  if(!processed && count == LED_CMD_MAGIC_LEN) {
+    uint8_t is_boot = 1;
+    for(int i = 0; i < LED_CMD_HEADER_LEN; i++) {
+      if(buf_in[i] != reboot_magic_header[i]) { is_boot = 0; break; }
+    }
+    if(is_boot) {
+      uint8_t ack = 0x42; // 'B'
+      echo_all(&ack, 1);
+      tud_vendor_flush();
+      // Let the ack drain to the host, then reboot. watchdog_reboot(0,0,delay)
+      // performs a normal boot back into the application.
+      busy_wait_ms(20);
+      watchdog_reboot(0, 0, 0); // does not return
+    }
+  }
+
+  // Check for WebUSB landing-page toggle/query magic sequence
+  if(!processed && count == LANDING_MAGIC_LEN) {
+    uint8_t is_land = 1;
+    for(int i = 0; i < LANDING_MAGIC_HEADER_LEN; i++) {
+      if(buf_in[i] != landing_magic_header[i]) {
+        is_land = 0;
+        break;
+      }
+    }
+    if(is_land) {
+      uint8_t value = buf_in[LANDING_MAGIC_HEADER_LEN];
+      if(value != 0xFF) {  // 0xFF = query only, don't change
+        set_landing_page_enabled(value != 0);
+      }
+      uint8_t ack = landing_page_enabled() ? 1 : 0;
       echo_all(&ack, 1);
       processed = 1;
     }
@@ -587,7 +802,7 @@ void led_blinking_task(void)
 
   if (led_state) {
     if (blink_interval_ms == BLINK_MOUNTED)
-      set_neopixel(0x050000); // Green
+      apply_led_for_slot(0); // connected
     else if (blink_interval_ms == BLINK_NOT_MOUNTED)
       set_neopixel(0x000500); // Red
   } else {
